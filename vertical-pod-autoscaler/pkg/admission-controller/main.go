@@ -19,12 +19,14 @@ package main
 import (
 	"flag"
 	"fmt"
+	"strconv"
 
 	"net/http"
 	"os"
 	"time"
 
 	apiv1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/common"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/admission-controller/logic"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/admission-controller/resource/pod"
@@ -36,6 +38,7 @@ import (
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/limitrange"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics"
 	metrics_admission "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics/admission"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/privatecertmanager"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/status"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 	"k8s.io/client-go/informers"
@@ -43,6 +46,7 @@ import (
 	"k8s.io/client-go/rest"
 	kube_flag "k8s.io/component-base/cli/flag"
 	"k8s.io/klog"
+	controller "sigs.k8s.io/controller-runtime"
 )
 
 const (
@@ -51,22 +55,24 @@ const (
 )
 
 var (
+	scheme             = runtime.NewScheme()
 	certsConfiguration = &certsConfig{
 		clientCaFile:  flag.String("client-ca-file", "/etc/tls-certs/caCert.pem", "Path to CA PEM file."),
 		tlsCertFile:   flag.String("tls-cert-file", "/etc/tls-certs/serverCert.pem", "Path to server certificate PEM file."),
 		tlsPrivateKey: flag.String("tls-private-key", "/etc/tls-certs/serverKey.pem", "Path to server certificate key PEM file."),
 	}
 
-	port               = flag.Int("port", 8000, "The port to listen on.")
-	address            = flag.String("address", ":8944", "The address to expose Prometheus metrics.")
-	namespace          = os.Getenv("NAMESPACE")
-	serviceName        = flag.String("webhook-service", "vpa-webhook", "Kubernetes service under which webhook is registered. Used when registerByURL is set to false.")
-	webhookAddress     = flag.String("webhook-address", "", "Address under which webhook is registered. Used when registerByURL is set to true.")
-	webhookPort        = flag.String("webhook-port", "", "Server Port for Webhook")
-	webhookTimeout     = flag.Int("webhook-timeout-seconds", 30, "Timeout in seconds that the API server should wait for this webhook to respond before failing.")
-	registerWebhook    = flag.Bool("register-webhook", true, "If set to true, admission webhook object will be created on start up to register with the API server.")
-	registerByURL      = flag.Bool("register-by-url", false, "If set to true, admission webhook will be registered by URL (webhookAddress:webhookPort) instead of by service name")
-	vpaObjectNamespace = flag.String("vpa-object-namespace", apiv1.NamespaceAll, "Namespace to search for VPA objects. Empty means all namespaces will be used.")
+	port                 = flag.Int("port", 8000, "The port to listen on.")
+	address              = flag.String("address", ":8944", "The address to expose Prometheus metrics.")
+	namespace            = os.Getenv("NAMESPACE")
+	serviceName          = flag.String("webhook-service", "vpa-webhook", "Kubernetes service under which webhook is registered. Used when registerByURL is set to false.")
+	webhookAddress       = flag.String("webhook-address", "", "Address under which webhook is registered. Used when registerByURL is set to true.")
+	webhookPort          = flag.String("webhook-port", "", "Server Port for Webhook")
+	webhookTimeout       = flag.Int("webhook-timeout-seconds", 30, "Timeout in seconds that the API server should wait for this webhook to respond before failing.")
+	registerWebhook      = flag.Bool("register-webhook", true, "If set to true, admission webhook object will be created on start up to register with the API server.")
+	registerByURL        = flag.Bool("register-by-url", false, "If set to true, admission webhook will be registered by URL (webhookAddress:webhookPort) instead of by service name")
+	vpaObjectNamespace   = flag.String("vpa-object-namespace", apiv1.NamespaceAll, "Namespace to search for VPA objects. Empty means all namespaces will be used.")
+	enableCertManagement = flag.Bool("enable-private-cert-management", false, "If set to true, Private Cert Management will be enabled")
 )
 
 func main() {
@@ -74,9 +80,30 @@ func main() {
 	kube_flag.InitFlags()
 	klog.V(1).Infof("Vertical Pod Autoscaler %s Admission Controller", common.VerticalPodAutoscalerVersion)
 
+	webPort, _ := strconv.Atoi(*webhookPort)
 	healthCheck := metrics.NewHealthCheck(time.Minute, false)
 	metrics.Initialize(*address, healthCheck)
 	metrics_admission.Register()
+
+	cfg := controller.GetConfigOrDie()
+	mgr, err := controller.NewManager(cfg, controller.Options{
+		Scheme:             scheme,
+		MetricsBindAddress: *address,
+		Port:               webPort,
+	})
+	if err != nil {
+		klog.Fatalf("unable to start manager %v", err)
+		os.Exit(1)
+	}
+
+	klog.V(1).Infof("Starting the cert configurations")
+
+	privatecertsCreated, err := privatecertmanager.CreatePrivateCert(mgr, *enableCertManagement)
+	if err != nil {
+		klog.Fatalf("unable to set up cert rotation %v", err)
+		os.Exit(1)
+	}
+	fmt.Println(privatecertsCreated)
 
 	certs := initCerts(*certsConfiguration)
 
@@ -140,4 +167,5 @@ func main() {
 		statusUpdater.Run(stopCh)
 	}()
 	server.ListenAndServeTLS("", "")
+
 }
